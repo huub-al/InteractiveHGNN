@@ -271,9 +271,6 @@ class arXivSubGraph:
     Attributes:
         hypergraph (arXivHyperGraph): Reference to the parent hypergraph
         indices (list): List of indices in the parent graph
-        fake_papers (list): List of indices of fake papers in the subgraph
-        plausible_papers (list): List of indices of plausible papers in the subgraph
-        synthetic_papers (list): List of indices of all papers with synthetic labels
         embeddings (torch.Tensor): Paper embeddings matrix for the subgraph
         labels (torch.Tensor): Paper labels tensor for the subgraph
         node_to_authors (dict): Mapping from node indices to author lists
@@ -282,19 +279,20 @@ class arXivSubGraph:
         val_mask (torch.Tensor): Boolean mask for validation nodes in subgraph
     """
     
-    def __init__(self, hypergraph: arXivHyperGraph, indices):
+    def __init__(self, hypergraph: arXivHyperGraph, indices, outlier_only_masks=False, outlier_indices=None):
         """
         Initialize the subgraph from a subset of the full hypergraph.
         
         Args:
             hypergraph (arXivHyperGraph): The parent hypergraph
             indices (list or array): Indices of papers to include in the subgraph
+            outlier_only_masks (bool): If True, only outliers will be included in train/val masks
+            outlier_indices (list): List of main graph indices that are outliers (for neighborhoods)
         """
         self.hypergraph = hypergraph
         self.indices = list(indices)
-        self.fake_papers = []
-        self.plausible_papers = []
-        self.synthetic_papers = []  # Track all papers with synthetic labels
+        self.sub_idx_to_main = {i: idx for i, idx in enumerate(indices)}
+        self.outlier_only_masks = outlier_only_masks
 
         # Extract relevant data for the subgraph
         self.embeddings = hypergraph.x[indices]
@@ -305,7 +303,10 @@ class arXivSubGraph:
         self._rebuild_incidence()
 
         self.outliers = []  # Track removed outlier indices (relative to subgraph)
+        self.main_outliers_idx = outlier_indices if outlier_indices is not None else []
         self.removed_outliers_data = {}  # Maps index to (embedding, label, authors)
+
+        self.generate_masks()
 
     def _rebuild_incidence(self):
         """
@@ -334,154 +335,6 @@ class arXivSubGraph:
         # Convert to sparse format for efficiency
         self.incidence = incidence.to_sparse_coo()
 
-    def add_papers(self, n, fake=0.3, plausible=0.3):
-        """
-        Add papers to the subgraph with specified proportions of real, fake, and plausible papers.
-        
-        Args:
-            n (int): Total number of papers to add
-            fake (float): Fraction of papers that should be fake
-            plausible (float): Fraction of papers that should be plausible
-            
-        Note:
-            - Real papers are actual papers from the parent graph not yet in the subgraph
-            - Fake papers have random embeddings and are labeled as "not scientific work"
-            - Plausible papers use embeddings from existing papers but with new author sets,
-              and are labeled as "not a likely collaboration"
-        """
-        n_fake = int(n * fake)
-        n_plausible = int(n * plausible)
-        n_real = n - n_fake - n_plausible
-        mean_authors = self.hypergraph.author_mean
-
-        new_embeddings, new_labels, new_authors = [], [], []
-
-        # Add real papers (with original labels)
-        current_ids = {self.hypergraph.paper_ids[i] for i in self.indices}
-        remaining = [i for i, pid in enumerate(self.hypergraph.paper_ids) if pid not in current_ids]
-        selected_real = random.sample(remaining, min(n_real, len(remaining)))
-
-        for idx in selected_real:
-            new_embeddings.append(self.hypergraph.x[idx])
-            new_labels.append(self.hypergraph.y[idx].item())
-            new_authors.append(self.hypergraph.node_to_authors[idx])
-
-        # Get the synthetic label indices directly from the hypergraph
-        not_scientific_work_idx = self.hypergraph.synthetic_labels["not scientific work"]
-        not_likely_collab_idx = self.hypergraph.synthetic_labels["not a likely collaboration"]
-
-        # Debug: Print synthetic label indices
-        # print(f"DEBUG: Synthetic label indices - not_scientific_work: {not_scientific_work_idx}, not_likely_collab: {not_likely_collab_idx}")
-
-        # Add fake papers with synthetic label "not scientific work"
-        for _ in range(n_fake):
-            emb = torch.randn(self.hypergraph.x.shape[1])
-            num_authors = max(1, int(np.random.poisson(mean_authors)))
-            authors = random.sample(self.hypergraph.author_pool, num_authors)
-            new_embeddings.append(emb)
-            new_labels.append(not_scientific_work_idx)
-            new_authors.append(authors)
-            # Track the index of this fake paper in the subgraph
-            paper_idx = len(self.labels) + len(new_labels) - 1
-            self.fake_papers.append(paper_idx)
-            self.synthetic_papers.append(paper_idx)
-
-        # Add plausible papers with synthetic label "not a likely collaboration"
-        for _ in range(n_plausible):
-            # Find a paper with authors not already in the graph
-            while True:
-                idx = random.randint(0, len(self.hypergraph.x) - 1)
-                existing_authors = set(self.hypergraph.node_to_authors[idx])
-                num_authors = max(1, int(np.random.poisson(mean_authors)))
-                candidate_authors = list(set(self.hypergraph.author_pool) - existing_authors)
-                if len(candidate_authors) >= num_authors:
-                    authors = random.sample(candidate_authors, num_authors)
-                    break
-            # Use embedding from existing paper but with new author set
-            new_embeddings.append(self.hypergraph.x[idx])
-            new_labels.append(not_likely_collab_idx)
-            new_authors.append(authors)
-            # Track the index of this plausible paper in the subgraph
-            paper_idx = len(self.labels) + len(new_labels) - 1
-            self.plausible_papers.append(paper_idx)
-            self.synthetic_papers.append(paper_idx)
-
-        # Combine new papers into the subgraph
-        if new_embeddings:
-            self.embeddings = torch.cat([self.embeddings, torch.stack(new_embeddings)], dim=0)
-            self.labels = torch.cat([self.labels, torch.tensor(new_labels, dtype=torch.long)], dim=0)
-            offset = len(self.node_to_authors)
-            for i, authors in enumerate(new_authors):
-                self.node_to_authors[offset + i] = authors
-
-            # # Debug: Print label distribution after adding papers
-            # unique_labels, counts = torch.unique(self.labels, return_counts=True)
-            # print("DEBUG: Label distribution after adding papers:")
-            # for label, count in zip(unique_labels, counts):
-            #     print(f"  Label {label.item()}: {count.item()} papers")
-
-            # Rebuild the incidence matrix to include new papers
-            self._rebuild_incidence()
-            
-            # Regenerate masks after adding new papers
-            self.generate_masks()
-
-    def remove_fake_papers(self):
-        """
-        Remove all papers with synthetic labels from the subgraph.
-        
-        This method removes papers labeled as "not scientific work" and
-        "not a likely collaboration", then rebuilds the incidence matrix
-        to maintain the correct graph structure.
-        """
-        if not self.synthetic_papers and len(self.hypergraph.synthetic_labels) == 0:
-            return
-            
-        # Get all synthetic label indices
-        synthetic_label_indices = list(self.hypergraph.synthetic_labels.values())
-        
-        # # Debug: Print synthetic label indices before removal
-        # print(f"DEBUG: Removing papers with synthetic labels: {synthetic_label_indices}")
-        # print(f"DEBUG: Current labels: {torch.unique(self.labels).tolist()}")
-        
-        # Create a mask of papers to keep (exclude all papers with synthetic labels)
-        keep = []
-        for i in range(len(self.labels)):
-            label = self.labels[i].item()
-            if i not in self.synthetic_papers and label not in synthetic_label_indices:
-                keep.append(i)
-        
-        # # Debug: Print papers to keep and remove
-        # print(f"DEBUG: Keeping {len(keep)} papers out of {len(self.labels)}")
-        # print(f"DEBUG: Removing {len(self.labels) - len(keep)} papers")
-        
-        # Update embeddings, labels, and author mappings
-        self.embeddings = self.embeddings[keep]
-        self.labels = self.labels[keep]
-        
-        # Rebuild node_to_authors with new indices
-        new_node_to_authors = {}
-        for i, idx in enumerate(keep):
-            new_node_to_authors[i] = self.node_to_authors[idx]
-        self.node_to_authors = new_node_to_authors
-        
-        # Clear all synthetic paper lists
-        self.fake_papers.clear()
-        self.plausible_papers.clear()
-        self.synthetic_papers.clear()
-        
-        # # Debug: Print final label distribution
-        # unique_labels, counts = torch.unique(self.labels, return_counts=True)
-        # print("DEBUG: Label distribution after removing synthetic papers:")
-        # for label, count in zip(unique_labels, counts):
-        #     print(f"  Label {label.item()}: {count.item()} papers")
-        
-        # Rebuild the incidence matrix
-        self._rebuild_incidence()
-        
-        # Regenerate masks after removing papers
-        self.generate_masks()
-
     def remove_outliers(self, outlier_fraction=0.01):
         """
         Remove papers that are statistical outliers based on embedding distance from the mean.
@@ -504,8 +357,19 @@ class arXivSubGraph:
         _, outlier_indices = torch.topk(distances, num_outliers, largest=True)
         outlier_indices = outlier_indices.tolist()
         
+        # Store main graph indices of outliers before updating sub_idx_to_main
+        main_outlier_indices = [self.sub_idx_to_main[i] for i in outlier_indices]
+        self.main_outliers_idx.extend(main_outlier_indices)
+        self.outliers.extend(outlier_indices)
+        
         # Create list of indices to keep
         keep_indices = [i for i in range(len(self.embeddings)) if i not in outlier_indices]
+        
+        # Update sub_idx_to_main mapping
+        new_sub_idx_to_main = {}
+        for new_i, old_i in enumerate(keep_indices):
+            new_sub_idx_to_main[new_i] = self.sub_idx_to_main[old_i]
+        self.sub_idx_to_main = new_sub_idx_to_main
         
         print(f"Removing {len(outlier_indices)} outliers out of {len(self.embeddings)} total papers ({len(outlier_indices)/len(self.embeddings)*100:.1f}%)")
         
@@ -516,9 +380,6 @@ class arXivSubGraph:
                 self.labels[i].clone(),
                 self.node_to_authors[i].copy(),  # Copy the author list
             )
-        
-        # Track outlier indices
-        self.outliers.extend(outlier_indices)
         
         # Keep only non-outlier data
         self.embeddings = self.embeddings[keep_indices]
@@ -536,82 +397,162 @@ class arXivSubGraph:
         # Regenerate masks after removing outliers
         self.generate_masks()
 
-    def restore_outliers(self):
-        """
-        Restore previously removed outlier papers back into the subgraph.
-        """
-        if not self.removed_outliers_data:
-            return
-
-        new_embeddings, new_labels = [], []
-        new_authors = []
-
-        for old_idx in self.outliers:
-            emb, label, authors = self.removed_outliers_data[old_idx]
-            new_embeddings.append(emb.unsqueeze(0))
-            new_labels.append(label.unsqueeze(0))
-            new_authors.append(authors)
-
-        if new_embeddings:
-            self.embeddings = torch.cat([self.embeddings] + new_embeddings, dim=0)
-            self.labels = torch.cat([self.labels] + new_labels, dim=0)
-            offset = len(self.node_to_authors)
-            for i, authors in enumerate(new_authors):
-                self.node_to_authors[offset + i] = authors
-
-            self._rebuild_incidence()
-            
-            # Regenerate masks after restoring outliers
-            self.generate_masks()
-
-        # Clear tracking
-        self.outliers.clear()
-        self.removed_outliers_data.clear()
-
-    def construct_outlier_neighbourhood(self):
+    def construct_outlier_neighbourhood(self, outlier_masks):
         """
         Construct a subgraph containing only the outliers and their one-hop neighbors.
         
         Returns:
             arXivSubGraph: A new subgraph containing only the outliers and their neighbors,
-                          or None if no outliers exist.
+                        or None if no outliers exist.
         """
         if not self.outliers:
             print("No outliers to construct neighborhood from.")
             return None
             
-        # Get all authors from outliers
+        # Get all authors from outliers (from saved data)
         outlier_authors = set()
         for old_idx in self.outliers:
             _, _, authors = self.removed_outliers_data[old_idx]
             outlier_authors.update(authors)
             
-        # Find all papers that share authors with outliers (one-hop neighbors)
+        # Find neighbors in the CURRENT subgraph that share authors with outliers
         neighbor_indices = set()
         for idx, authors in self.node_to_authors.items():
             if any(author in outlier_authors for author in authors):
-                neighbor_indices.add(idx)
+                neighbor_indices.add(self.sub_idx_to_main[idx])  # Convert to main graph index
                 
-        # Combine outlier indices with neighbor indices
-        # Note: We need to map the old outlier indices to their new positions
-        # in the current graph structure
-        all_indices = list(neighbor_indices)
+        # Combine outliers and neighbors
+        all_indices = set()
         
-        # Create a new subgraph with these indices
-        return arXivSubGraph(self.hypergraph, all_indices)
+        # Add outlier indices (from main graph)
+        all_indices.update(self.main_outliers_idx)
+        
+        # Add neighbor indices  
+        all_indices.update(neighbor_indices)
+            
+        # Convert to sorted list for consistency
+        all_indices = sorted(list(all_indices))
+        
+        print(f"Constructing outlier neighborhood with {len(self.main_outliers_idx)} outliers and {len(neighbor_indices)} neighbors (total: {len(all_indices)})")
+        print(f"Outlier percentage: {len(self.main_outliers_idx)/len(all_indices)*100:.1f}%")
+        
+        # Create a new subgraph with these indices and outlier-only masks
+        return arXivSubGraph(self.hypergraph, all_indices, outlier_only_masks=outlier_masks, outlier_indices=self.main_outliers_idx)
 
     def generate_masks(self):
         """
         Generate training and validation masks for the subgraph based on the parent graph's masks.
-        The masks are generated by mapping the parent graph's train/val assignments to the subgraph's indices.
+        
+        If outlier_only_masks is True, only outliers will be included in train/val masks.
+        Otherwise, all nodes will be included based on their parent graph assignments.
         """
-        num_nodes = len(self.indices)
+        num_nodes = len(self.embeddings)  # Use embeddings length to get current number of nodes
         self.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
         self.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
         
-        # Map parent graph's train/val assignments to subgraph indices
-        for i, parent_idx in enumerate(self.indices):
-            if self.hypergraph.train_mask[parent_idx]:
-                self.train_mask[i] = True
-            elif self.hypergraph.val_mask[parent_idx]:
-                self.val_mask[i] = True
+        if self.outlier_only_masks:
+            # Only include outliers in the masks
+            for i, parent_idx in self.sub_idx_to_main.items():
+                # Check if this node is an outlier (in main_outliers_idx)
+                if parent_idx in self.main_outliers_idx:
+                    if self.hypergraph.train_mask[parent_idx]:
+                        self.train_mask[i] = True
+                    elif self.hypergraph.val_mask[parent_idx]:
+                        self.val_mask[i] = True
+        else:
+            # Include all nodes based on their parent graph assignments
+            for i, parent_idx in self.sub_idx_to_main.items():
+                if self.hypergraph.train_mask[parent_idx]:
+                    self.train_mask[i] = True
+                elif self.hypergraph.val_mask[parent_idx]:
+                    self.val_mask[i] = True
+
+    def generate_neighbourhoods(self, outliers_per_subgraph=25):
+        """
+        Generate a list of subgraphs containing outliers and their one-hop neighbors.
+        Outliers are evenly distributed across neighborhoods, with validation outliers
+        distributed evenly across all neighborhoods.
+        
+        Args:
+            outliers_per_subgraph (int): Number of outliers to include in each subgraph (default: 25)
+            
+        Returns:
+            list: List of arXivSubGraph objects, each containing outliers and their neighbors
+        """
+        if not self.outliers:
+            print("No outliers to generate neighborhoods from.")
+            return []
+        
+        # Get all outlier authors from the removed outliers data
+        outlier_authors = set()
+        for old_idx in self.outliers:
+            _, _, authors = self.removed_outliers_data[old_idx]
+            outlier_authors.update(authors)
+        
+        # Find all neighbors in the CURRENT subgraph that share authors with outliers
+        neighbor_indices = set()
+        for idx, authors in self.node_to_authors.items():
+            if any(author in outlier_authors for author in authors):
+                neighbor_indices.add(self.sub_idx_to_main[idx])  # Convert to main graph index
+        
+        # Group outliers by their train/val status in the parent graph
+        train_outliers = []
+        val_outliers = []
+        
+        for old_idx in self.outliers:
+            # Get the main graph index for this outlier
+            main_idx = self.main_outliers_idx[self.outliers.index(old_idx)]
+            
+            if self.hypergraph.train_mask[main_idx]:
+                train_outliers.append(old_idx)
+            elif self.hypergraph.val_mask[main_idx]:
+                val_outliers.append(old_idx)
+        
+        print(f"Found {len(train_outliers)} training outliers and {len(val_outliers)} validation outliers")
+        
+        # Calculate number of neighborhoods needed
+        total_outliers = len(train_outliers) + len(val_outliers)
+        num_neighborhoods = max(1, total_outliers // outliers_per_subgraph)
+        print(f"Creating {num_neighborhoods} neighborhoods with approximately {outliers_per_subgraph} outliers each")
+        
+        # Evenly divide training outliers
+        train_per_neigh = len(train_outliers) // num_neighborhoods
+        train_remainder = len(train_outliers) % num_neighborhoods
+        # Evenly divide validation outliers
+        val_per_neigh = len(val_outliers) // num_neighborhoods
+        val_remainder = len(val_outliers) % num_neighborhoods
+        
+        subgraphs = []
+        train_used = 0
+        val_used = 0
+        for i in range(num_neighborhoods):
+            this_train = train_per_neigh + (1 if i < train_remainder else 0)
+            this_val = val_per_neigh + (1 if i < val_remainder else 0)
+            selected_train = train_outliers[train_used:train_used+this_train]
+            selected_val = val_outliers[val_used:val_used+this_val]
+            selected_outliers = selected_train + selected_val
+            if not selected_outliers:
+                continue
+            train_used += this_train
+            val_used += this_val
+            # Get authors from selected outliers
+            selected_authors = set()
+            for old_idx in selected_outliers:
+                _, _, authors = self.removed_outliers_data[old_idx]
+                selected_authors.update(authors)
+            # Find neighbors that share authors with selected outliers
+            subgraph_neighbors = set()
+            for idx, authors in self.node_to_authors.items():
+                if any(author in selected_authors for author in authors):
+                    subgraph_neighbors.add(self.sub_idx_to_main[idx])
+            # Combine selected outliers and their neighbors
+            all_indices = set()
+            selected_outlier_main_indices = [self.main_outliers_idx[self.outliers.index(old_idx)] for old_idx in selected_outliers]
+            all_indices.update(selected_outlier_main_indices)
+            all_indices.update(subgraph_neighbors)
+            all_indices = sorted(list(all_indices))
+            print(f"Creating subgraph {i+1}/{num_neighborhoods} with {len(selected_outliers)} outliers ({len(selected_train)} train, {len(selected_val)} val) and {len(subgraph_neighbors)} neighbors (total: {len(all_indices)})")
+            subgraph = arXivSubGraph(self.hypergraph, all_indices, outlier_only_masks=True, outlier_indices=selected_outlier_main_indices)
+            subgraphs.append(subgraph)
+        print(f"Generated {len(subgraphs)} outlier neighborhood subgraphs")
+        return subgraphs
